@@ -4,6 +4,7 @@ import logging
 import threading
 import tkinter as tk
 import warnings
+from typing import Any
 
 warnings.simplefilter("ignore", DeprecationWarning)
 
@@ -13,6 +14,7 @@ import serial.tools.list_ports
 from pymodbus.framer import FramerType
 from pymodbus.server import ModbusSerialServer
 from pymodbus.simulator import DataType, SimData, SimDevice
+from pymodbus.simulator.simcore import SimCore
 
 # ── 데이터 블록 표시 상수 ────────────────────────────────────────
 REG_TOTAL     = 65536                             # 주소 1 ~ 65535 (0-indexed 0~65534)
@@ -88,6 +90,8 @@ class ModbusServerApp:
             lambda d, m: self.root.after(0, lambda dd=d, mm=m: self.log_serial(dd, mm))
         )
 
+        self._led_tx: tuple | None = None
+        self._led_rx: tuple | None = None
         self._build_ui()
 
     # ── UI 구성 ──────────────────────────────────────────────────
@@ -307,7 +311,7 @@ class ModbusServerApp:
 
     def _build_settings(self, parent: ttk.Frame):
         # (widget, state_when_enabled) – 서버 실행 중에는 모두 disabled
-        self._cfg_widgets: list[tuple[tk.Widget, str]] = []
+        self._cfg_widgets: list[tuple[Any, str]] = []
 
         cfg = ttk.LabelFrame(parent, text="시리얼 포트 설정", padding=10)
         cfg.pack(padx=15, pady=15, fill="x")
@@ -417,8 +421,11 @@ class ModbusServerApp:
 
     def _blink_led(self, which: str, ms: int = 150):
         """TX 또는 RX LED를 ms동안 켜다 끄다."""
-        cv, oid = self._led_tx if which == "TX" else self._led_rx
-        color   = "#FF8800" if which == "TX" else "#00BB44"
+        led = self._led_tx if which == "TX" else self._led_rx
+        if led is None:
+            return
+        cv, oid = led
+        color = "#FF8800" if which == "TX" else "#00BB44"
         cv.itemconfig(oid, fill=color)
         self.root.after(ms, lambda: cv.itemconfig(oid, fill="#444444"))
 
@@ -452,24 +459,30 @@ class ModbusServerApp:
             return
         try:
             if self.server is not None:
-                ctx = self.server.context
-                if hasattr(ctx, "__getitem__"):
-                    slave_id = int(self.slave_id_var.get())
-                    dev = ctx[slave_id]
-                    if hasattr(dev, "getValues"):
-                        key = self._active_db_key()
-                        fc_map = {"co": 1, "di": 2, "hr": 3, "ir": 4}
-                        first_row, last_row = self._visible_row_range(key)
-                        start_idx = first_row * COLS
-                        count = min(
-                            (last_row - first_row + 1) * COLS,
-                            REG_TOTAL - start_idx)
-                        if count > 0:
-                            vals = dev.getValues(
-                                fc_map[key], start_idx + 1, count=count)
-                            cache = self._data_cache(key)
-                            for i, v in enumerate(vals):
-                                cache[start_idx + i] = v
+                ctx = self.server.context   # ModbusServerContext | SimCore
+                slave_id = int(self.slave_id_var.get())
+                if not isinstance(ctx, SimCore) or slave_id not in ctx.devices:
+                    raise LookupError
+                rt = ctx.devices[slave_id]   # SimRuntime (타입 SimCore로 좁혀짐)
+                key = self._active_db_key()
+                block_key = {"co": "c", "di": "d", "hr": "h", "ir": "i"}[key]
+                blk    = rt.block[block_key]  # (start_addr, count, values_list, ...)
+                values = blk[2]               # 라이브 뮤터블 리스트
+                first_row, last_row = self._visible_row_range(key)
+                start_idx = first_row * COLS
+                count     = min((last_row - first_row + 1) * COLS, REG_TOTAL - start_idx)
+                cache = self._data_cache(key)
+                if block_key in ("h", "i"):
+                    # 레지스터: values[i] = Modbus 주소 i+1 = cache[i]
+                    end = min(start_idx + count, len(values))
+                    cache[start_idx:end] = values[start_idx:end]
+                else:
+                    # 코일/DI: 비트 패킹 — (values[addr//8] >> (addr%8)) & 1
+                    for i in range(count):
+                        addr     = start_idx + i + 1  # 1-based Modbus 주소
+                        byte_idx = addr // 8
+                        bit_idx  = addr % 8
+                        cache[start_idx + i] = ((values[byte_idx] >> bit_idx) & 1 if byte_idx < len(values) else 0)
         except Exception:
             pass
 
@@ -503,7 +516,6 @@ class ModbusServerApp:
             [SimData(1, values=[0] * 65535, datatype=DataType.REGISTERS)],  # ir
         ))]
 
-        self.loop = asyncio.new_event_loop()
         self.server_thread = threading.Thread(
             target=self._run_loop,
             args=(port, baudrate, bytesize, parity, stopbits, framer),
@@ -529,11 +541,10 @@ class ModbusServerApp:
         self.root.after(500, self._poll_registers)
 
     def _run_loop(self, port, baudrate, bytesize, parity, stopbits, framer):
+        self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         try:
-            self.loop.run_until_complete(
-                self._serve(port, baudrate, bytesize, parity, stopbits, framer)
-            )
+            self.loop.run_until_complete(self._serve(port, baudrate, bytesize, parity, stopbits, framer))
         except Exception as e:
             self.root.after(0, lambda err=e: self.log(f"서버 오류: {err}", "error"))
         finally:
@@ -552,6 +563,7 @@ class ModbusServerApp:
         # → ModbusSerialServer + serve_forever(background=True) 를 사용해야 함.
         # serve_forever(background=True) 는 listen()으로 포트만 열고 즉시 반환한다.
         self._stop_event = asyncio.Event()
+        assert self.context is not None
         last_err: Exception | None = None
         srv: ModbusSerialServer | None = None
         for attempt in range(5):
