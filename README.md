@@ -1,5 +1,8 @@
 # ModbusSerialServerApp
 
+## Precaution
+This application is currently under development. Use of this application is at your own risk.
+
 ## 📋 Overview
 **Modbus Serial Server** is a Python-based GUI application that implements a Modbus serial server supporting both **RTU** and **ASCII** protocols. It provides real-time monitoring and management of Modbus data blocks with an intuitive interface.
 
